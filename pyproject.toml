@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rnlog"
+version = "0.1.0"
+description = "Telemetry logger for Reticulum Network Stack interfaces"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    {name = "Ian", email = "ian@example.com"},
+]
+dependencies = [
+    "rns>=0.8.0",
+]
+
+[project.scripts]
+rnlog = "rnlog.cli:main"
+
+[project.urls]
+Repository = "https://github.com/glassontin/rnlog"
