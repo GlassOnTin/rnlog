@@ -27,6 +27,49 @@ from .db import open_db, store_reading, query_readings, get_summary
 from .telemetry import extract_telemetry, format_summary
 
 
+def cmd_serve(args):
+    """Run an rnlog collector destination that accepts telemetry over Reticulum."""
+    from .relay import CollectorServer
+
+    try:
+        reticulum = RNS.Reticulum(
+            configdir=args.config,
+            loglevel=3 + args.verbose,
+            require_shared_instance=True,
+        )
+    except Exception:
+        print("Could not connect to shared RNS instance. Is rnsd running?")
+        sys.exit(1)
+
+    db_path = Path(args.db) if args.db else None
+    server = CollectorServer(reticulum, db_path=db_path)
+
+    print()
+    print("=" * 60)
+    print("  rnlog — Telemetry Collector")
+    print("=" * 60)
+    print(f"  Destination: {server.dest_hash}")
+    print(f"  Database:    {args.db or '~/.rnlog/telemetry.db'}")
+    print("  Press Ctrl+C to stop.")
+    print("=" * 60)
+    print()
+
+    shutdown = False
+
+    def handle_signal(signum, frame):
+        nonlocal shutdown
+        shutdown = True
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    while not shutdown:
+        time.sleep(1)
+
+    server.close()
+    print(f"\nStopped. {server.received} readings received.")
+
+
 def cmd_collect(args):
     """Continuously poll rnsd and store interface telemetry."""
     try:
@@ -49,11 +92,26 @@ def cmd_collect(args):
 
     iface_count = len(stats.get("interfaces", []))
 
+    # Set up Reticulum forwarding
+    relay_client = None
+    if args.dest:
+        from .relay import CollectorClient
+        relay_client = CollectorClient(reticulum, args.dest)
+        print(f"  Connecting to collector {args.dest}...")
+        try:
+            relay_client.connect()
+            print(f"  Connected.")
+        except Exception as e:
+            print(f"  Could not connect to collector: {e}")
+            sys.exit(3)
+
     print()
     print("=" * 60)
     print("  rnlog — Reticulum Telemetry Logger")
     print("=" * 60)
     print(f"  Database:   {args.db or '~/.rnlog/telemetry.db'}")
+    if relay_client:
+        print(f"  Collector:  {args.dest}")
     print(f"  Interfaces: {iface_count}")
     print(f"  Interval:   {args.interval}s")
     print("  Press Ctrl+C to stop.")
@@ -74,6 +132,7 @@ def cmd_collect(args):
         stats = reticulum.get_interface_stats()
         if stats and "interfaces" in stats:
             now = time.time()
+            batch = []
             for iface in stats["interfaces"]:
                 reading = extract_telemetry(iface)
                 if reading is None:
@@ -89,6 +148,14 @@ def cmd_collect(args):
                 store_reading(db, now, iface_name, iface_hash, reading)
                 total += 1
 
+                if relay_client:
+                    batch.append({
+                        "ts": now,
+                        "interface": iface_name,
+                        "interface_hash": iface_hash,
+                        "reading": reading,
+                    })
+
                 if not args.quiet:
                     summary = format_summary(reading)
                     ts = time.strftime("%H:%M:%S", time.localtime(now))
@@ -96,13 +163,28 @@ def cmd_collect(args):
 
             db.commit()
 
+            if relay_client and batch:
+                if not relay_client.connected:
+                    try:
+                        relay_client.connect()
+                    except Exception:
+                        pass
+                if relay_client.connected:
+                    relay_client.send(batch)
+
         for _ in range(args.interval):
             if shutdown:
                 break
             time.sleep(1)
 
+    if relay_client:
+        relay_client.close()
+
     db.close()
-    print(f"\nStopped. {total} readings stored.")
+    msg = f"\nStopped. {total} readings stored."
+    if relay_client:
+        msg += f" {relay_client.sent} forwarded."
+    print(msg)
 
 
 def cmd_query(args):
@@ -218,6 +300,35 @@ def _export_csv(readings, output):
         writer.writerow(row)
 
 
+def cmd_ingest(args):
+    """Read JSON lines from stdin and store as readings."""
+    db = open_db(Path(args.db) if args.db else None)
+    count = 0
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            store_reading(
+                db,
+                rec["ts"],
+                rec["interface"],
+                rec["interface_hash"],
+                rec["reading"],
+            )
+            count += 1
+            if count % 10 == 0:
+                db.commit()
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"Skipping bad record: {e}", file=sys.stderr)
+
+    db.commit()
+    db.close()
+    print(f"Ingested {count} readings.", file=sys.stderr)
+
+
 def _parse_duration(spec: str) -> float:
     """Parse a duration like '1h', '30m', '7d' into a Unix timestamp (now - duration)."""
     multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
@@ -266,11 +377,18 @@ def main():
 
     subparsers = parser.add_subparsers(dest="command")
 
+    # serve
+    subparsers.add_parser("serve", help="run telemetry collector destination")
+
     # collect
     collect_p = subparsers.add_parser("collect", help="poll rnsd and store telemetry")
     collect_p.add_argument(
         "-i", "--interval", type=int, default=30,
         help="seconds between polls (default: 30)",
+    )
+    collect_p.add_argument(
+        "-D", "--dest", type=str, default=None,
+        help="forward to rnlog collector destination hash",
     )
 
     # query
@@ -287,6 +405,9 @@ def main():
         "-n", "--limit", type=int, default=None,
         help="max number of readings (default: 20)",
     )
+
+    # ingest
+    subparsers.add_parser("ingest", help="read JSON lines from stdin and store")
 
     # summary
     subparsers.add_parser("summary", help="show database summary")
@@ -316,8 +437,12 @@ def main():
         parser.print_help()
         sys.exit(0)
 
-    if args.command == "collect":
+    if args.command == "serve":
+        cmd_serve(args)
+    elif args.command == "collect":
         cmd_collect(args)
+    elif args.command == "ingest":
+        cmd_ingest(args)
     elif args.command == "query":
         cmd_query(args)
     elif args.command == "summary":
