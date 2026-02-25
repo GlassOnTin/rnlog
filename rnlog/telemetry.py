@@ -1,7 +1,9 @@
 """Extract telemetry from Reticulum interface stats."""
+from __future__ import annotations
+from typing import Optional
 
 
-def extract_telemetry(iface: dict) -> dict | None:
+def extract_telemetry(iface: dict) -> Optional[dict]:
     """Extract telemetry fields from an interface stats dict.
 
     Returns None if the interface has no telemetry data worth storing.

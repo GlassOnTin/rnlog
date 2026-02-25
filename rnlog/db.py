@@ -54,7 +54,7 @@ def query_readings(conn: sqlite3.Connection,
                    interface: str = None,
                    since: float = None,
                    until: float = None,
-                   limit: int = None) -> list[dict]:
+                   limit: int = None) -> list:
     """Query stored readings with optional filters."""
     sql = "SELECT id, ts, interface, interface_hash, reading FROM readings WHERE 1=1"
     params = []

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "rnlog"
 version = "0.1.0"
 description = "Telemetry logger for Reticulum Network Stack interfaces"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 license = "MIT"
 authors = [
     {name = "Ian", email = "ian@example.com"},

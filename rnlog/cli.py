@@ -183,7 +183,7 @@ def cmd_export(args):
     db.close()
 
 
-def _export_csv(readings: list[dict], output):
+def _export_csv(readings, output):
     """Export readings as flattened CSV."""
     if not readings:
         return
