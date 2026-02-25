@@ -5,11 +5,6 @@
 #   rnsd       - Reticulum transport node (TCP server on :4242, RNode on /dev/ttyACM0)
 #   lxmd       - LXMF propagation node + telemetry collector
 #
-# Addresses:
-#   Transport ID:           61514e1d8cc27242bec8bd647c076f87
-#   Propagation node:       d68a4b62ab7b2ad72cd4fa44a36b1257
-#   LXMF delivery (telem):  761aef52bdf6f08e88fd08be47769278
-#
 # Prerequisites: pip3 install rns lxmf
 #
 # Usage: scp -O -r router/ root@192.168.0.2:/tmp/rns-install && \
@@ -19,18 +14,27 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Load secrets
+if [ ! -f "$SCRIPT_DIR/secrets.sh" ]; then
+    echo "ERROR: $SCRIPT_DIR/secrets.sh not found."
+    echo "Copy secrets.sh.example to secrets.sh and fill in your values."
+    exit 1
+fi
+. "$SCRIPT_DIR/secrets.sh"
+
 echo "=== Reticulum LoRa Gateway installer ==="
 
-# Reticulum config
+# Reticulum config (substitute passphrase)
 mkdir -p /root/.reticulum/storage
-cp "$SCRIPT_DIR/reticulum.conf" /root/.reticulum/config
+sed "s/NETWORK_PASSPHRASE/$NETWORK_PASSPHRASE/g" \
+    "$SCRIPT_DIR/reticulum.conf" > /root/.reticulum/config
 echo "  Installed /root/.reticulum/config"
 
 # Restore transport identity (preserves transport address across reinstalls)
 if [ ! -f /root/.reticulum/storage/transport_identity ]; then
     python3 -c "
 import base64
-data = base64.b64decode('TRANSPORT_IDENTITY_B64_REMOVED==')
+data = base64.b64decode('$TRANSPORT_IDENTITY_B64')
 open('/root/.reticulum/storage/transport_identity','wb').write(data)
 "
     echo "  Restored transport identity"
@@ -47,7 +51,7 @@ echo "  Installed /root/.lxmd/config"
 if [ ! -f /root/.lxmd/identity ]; then
     python3 -c "
 import base64
-data = base64.b64decode('LXMD_IDENTITY_B64_REMOVED==')
+data = base64.b64decode('$LXMD_IDENTITY_B64')
 open('/root/.lxmd/identity','wb').write(data)
 "
     echo "  Restored lxmd identity"
