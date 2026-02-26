@@ -42,13 +42,18 @@ def cmd_serve(args):
         sys.exit(1)
 
     db_path = Path(args.db) if args.db else None
-    server = CollectorServer(reticulum, db_path=db_path)
+    server = CollectorServer(reticulum, db_path=db_path,
+                             sideband_dest=args.sideband_dest)
 
     print()
     print("=" * 60)
     print("  rnlog — Telemetry Collector")
     print("=" * 60)
     print(f"  Destination: {server.dest_hash}")
+    print(f"  Beacon:      {server.beacon_hash}")
+    if server.lxmf_relay:
+        print(f"  LXMF Relay:  {server.lxmf_relay.dest_hash}")
+        print(f"  Target:      {args.sideband_dest}")
     print(f"  Database:    {args.db or '~/.rnlog/telemetry.db'}")
     print("  Press Ctrl+C to stop.")
     print("=" * 60)
@@ -64,10 +69,15 @@ def cmd_serve(args):
     signal.signal(signal.SIGTERM, handle_signal)
 
     while not shutdown:
+        if server.lxmf_relay:
+            server.lxmf_relay.announce_if_needed()
         time.sleep(1)
 
     server.close()
-    print(f"\nStopped. {server.received} readings received.")
+    msg = f"\nStopped. {server.received} readings received."
+    if server.lxmf_relay:
+        msg += f" {server.lxmf_relay.sent} relayed via LXMF."
+    print(msg)
 
 
 def cmd_collect(args):
@@ -329,6 +339,49 @@ def cmd_ingest(args):
     print(f"Ingested {count} readings.", file=sys.stderr)
 
 
+def cmd_provision(args):
+    """Output collector key configuration for beacon firmware provisioning."""
+    from .relay import load_or_create_identity, ASPECT, ASPECT_COLLECTOR
+
+    reticulum = RNS.Reticulum(
+        configdir=args.config,
+        loglevel=3 + args.verbose,
+        require_shared_instance=True,
+    )
+
+    db_dir = Path(args.db).parent if args.db else Path.home() / ".rnlog"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    identity = load_or_create_identity(db_dir)
+
+    # X25519 public key (first 32 bytes of get_public_key())
+    pub_key = identity.get_public_key()[:32]
+
+    # Identity hash (HKDF salt)
+    identity_hash = identity.hash  # 16 bytes
+
+    # Destination hash for rnlog.collector SINGLE
+    dest = RNS.Destination(
+        identity, RNS.Destination.IN,
+        RNS.Destination.SINGLE,
+        ASPECT, ASPECT_COLLECTOR,
+    )
+    dest_hash = dest.hash  # 16 bytes
+
+    combined = pub_key + identity_hash + dest_hash  # 64 bytes
+
+    print()
+    print("Beacon Firmware Provisioning")
+    print("=" * 60)
+    print(f"  X25519 Public Key (32B): {pub_key.hex()}")
+    print(f"  Identity Hash    (16B): {identity_hash.hex()}")
+    print(f"  Dest Hash        (16B): {dest_hash.hex()}")
+    print()
+    print(f"  Combined (64B): {combined.hex()}")
+    print()
+    print("Send via KISS CMD_BCN_KEY (0x86) to configure beacon firmware.")
+    print("=" * 60)
+
+
 def _parse_duration(spec: str) -> float:
     """Parse a duration like '1h', '30m', '7d' into a Unix timestamp (now - duration)."""
     multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
@@ -378,7 +431,11 @@ def main():
     subparsers = parser.add_subparsers(dest="command")
 
     # serve
-    subparsers.add_parser("serve", help="run telemetry collector destination")
+    serve_p = subparsers.add_parser("serve", help="run telemetry collector destination")
+    serve_p.add_argument(
+        "--sideband-dest", metavar="HASH",
+        help="forward beacon telemetry as LXMF to this Sideband destination",
+    )
 
     # collect
     collect_p = subparsers.add_parser("collect", help="poll rnsd and store telemetry")
@@ -411,6 +468,10 @@ def main():
 
     # summary
     subparsers.add_parser("summary", help="show database summary")
+
+    # provision
+    subparsers.add_parser("provision",
+        help="output collector key config for beacon firmware")
 
     # export
     export_p = subparsers.add_parser("export", help="export readings")
@@ -449,6 +510,8 @@ def main():
         cmd_summary(args)
     elif args.command == "export":
         cmd_export(args)
+    elif args.command == "provision":
+        cmd_provision(args)
 
 
 if __name__ == "__main__":
