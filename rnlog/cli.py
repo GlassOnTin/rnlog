@@ -346,7 +346,7 @@ def cmd_provision(args):
     reticulum = RNS.Reticulum(
         configdir=args.config,
         loglevel=3 + args.verbose,
-        require_shared_instance=True,
+        require_shared_instance=False,
     )
 
     db_dir = Path(args.db).parent if args.db else Path.home() / ".rnlog"
