@@ -19,5 +19,8 @@ dependencies = [
 [project.scripts]
 rnlog = "rnlog.cli:main"
 
+[tool.setuptools.packages.find]
+include = ["rnlog*"]
+
 [project.urls]
 Repository = "https://github.com/glassontin/rnlog"

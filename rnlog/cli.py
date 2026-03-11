@@ -94,6 +94,16 @@ def cmd_collect(args):
 
     db = open_db(Path(args.db) if args.db else None)
 
+    # Optional LXMF relay for GPS telemetry to Sideband
+    lxmf_relay = None
+    if args.sideband_dest:
+        from .relay import LxmfRelay, load_or_create_identity
+        db_dir = Path(args.db).parent if args.db else Path.home() / ".rnlog"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        identity = load_or_create_identity(db_dir)
+        lxmf_relay = LxmfRelay(identity=identity, storagepath=str(db_dir))
+        lxmf_relay.configure(args.sideband_dest)
+
     # Verify connectivity
     stats = reticulum.get_interface_stats()
     if not stats:
@@ -122,6 +132,9 @@ def cmd_collect(args):
     print(f"  Database:   {args.db or '~/.rnlog/telemetry.db'}")
     if relay_client:
         print(f"  Collector:  {args.dest}")
+    if lxmf_relay:
+        print(f"  LXMF Relay: {lxmf_relay.dest_hash}")
+        print(f"  Target:     {args.sideband_dest}")
     print(f"  Interfaces: {iface_count}")
     print(f"  Interval:   {args.interval}s")
     print("  Press Ctrl+C to stop.")
@@ -166,6 +179,22 @@ def cmd_collect(args):
                         "reading": reading,
                     })
 
+                if lxmf_relay and "gps" in reading and reading["gps"].get("fix"):
+                    beacon = {
+                        "lat": reading["gps"].get("lat", 0),
+                        "lon": reading["gps"].get("lon", 0),
+                        "alt": reading["gps"].get("alt", 0),
+                        "spd": reading["gps"].get("speed", 0),
+                        "hdop": reading["gps"].get("hdop", 10),
+                        "sat": reading["gps"].get("sats", 0),
+                        "bat": reading.get("device", {}).get("bat", 0),
+                        "fix": True,
+                    }
+                    try:
+                        lxmf_relay.relay_beacon(beacon)
+                    except Exception as e:
+                        RNS.log(f"rnlog: LXMF relay error: {e}", RNS.LOG_ERROR)
+
                 if not args.quiet:
                     summary = format_summary(reading)
                     ts = time.strftime("%H:%M:%S", time.localtime(now))
@@ -185,6 +214,8 @@ def cmd_collect(args):
         for _ in range(args.interval):
             if shutdown:
                 break
+            if lxmf_relay:
+                lxmf_relay.announce_if_needed()
             time.sleep(1)
 
     if relay_client:
@@ -194,6 +225,8 @@ def cmd_collect(args):
     msg = f"\nStopped. {total} readings stored."
     if relay_client:
         msg += f" {relay_client.sent} forwarded."
+    if lxmf_relay:
+        msg += f" {lxmf_relay.sent} relayed via LXMF."
     print(msg)
 
 
@@ -446,6 +479,10 @@ def main():
     collect_p.add_argument(
         "-D", "--dest", type=str, default=None,
         help="forward to rnlog collector destination hash",
+    )
+    collect_p.add_argument(
+        "--sideband-dest", metavar="HASH",
+        help="relay GPS telemetry as LXMF to this Sideband destination",
     )
 
     # query
