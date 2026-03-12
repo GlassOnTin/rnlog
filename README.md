@@ -120,15 +120,33 @@ The beacon location will appear on Sideband's map.
 
 ## Subcommands
 
-| Command     | Description                                          |
-|-------------|------------------------------------------------------|
-| `serve`     | Run collector destination (receives remote beacons)  |
-| `collect`   | Poll local rnsd and store interface telemetry        |
-| `provision` | Output collector key for beacon firmware provisioning|
-| `query`     | Query stored readings with filters                   |
-| `summary`   | Show database summary                                |
-| `export`    | Export readings as JSON or CSV                       |
-| `ingest`    | Read JSON lines from stdin and store                 |
+| Command          | Description                                             |
+|------------------|---------------------------------------------------------|
+| `serve`          | Run collector destination (receives remote beacons)     |
+| `collect`        | Poll local rnsd and store interface telemetry           |
+| `provision`      | Output collector key for legacy beacon firmware         |
+| `provision-lxmf` | Provision RNode with LXMF identity and collector key    |
+| `provision-ifac` | Provision RNode with IFAC network authentication key    |
+| `test-lxmf`      | Trigger and validate a test LXMF beacon over USB        |
+| `query`          | Query stored readings with filters                      |
+| `summary`        | Show database summary                                   |
+| `export`         | Export readings as JSON or CSV                          |
+| `ingest`         | Read JSON lines from stdin and store                    |
+
+### 4. LXMF beacon mode (recommended)
+
+For full LXMF-based beaconing with Sideband integration and IFAC network authentication, see the [beacon firmware documentation](../RNode_Firmware/Documentation/BEACON.md) for the complete setup workflow:
+
+```sh
+# Provision RNode with Sideband destination identity
+rnlog provision-lxmf --dest <SIDEBAND_DEST_HASH> --port /dev/ttyACM0
+
+# Provision IFAC key (must match receiver's network_name/passphrase)
+rnlog provision-ifac --name helv4net --passphrase 'R3ticulum-priv8-m3sh' --port /dev/ttyACM0
+
+# Test: trigger beacon and validate packet structure over USB
+rnlog test-lxmf --port /dev/ttyACM0
+```
 
 ## Examples
 
@@ -166,21 +184,24 @@ Data is stored in `~/.rnlog/telemetry.db` (SQLite with WAL mode).
 ## How it works
 
 ```
-┌──────────────┐     LoRa      ┌───────────────────────┐
-│  RNode       │  ─────────►   │  Router / PC          │
-│  (Heltec V4) │   beacon      │  running rnsd         │
-│              │   packets     │                       │
-│  GPS + LoRa  │               │  rnlog serve          │
-│  battery     │               │  ├─ SINGLE dest ◄──── │ encrypted beacons
-└──────────────┘               │  ├─ PLAIN dest  ◄──── │ plaintext beacons
-                               │  ├─ SQLite DB         │
-                               │  └─ LXMF relay ────►  │ Sideband (optional)
-                               └───────────────────────┘
+┌──────────────────┐     LoRa      ┌───────────────────────┐
+│  RNode           │  ─────────►   │  Router / PC          │
+│  (T-Beam/Heltec) │   beacon      │  running rnsd         │
+│                  │   packets     │                       │
+│  GPS + LoRa      │               │  rnlog serve          │
+│  battery         │               │  ├─ LXMF dest  ◄──── │ LXMF telemetry (recommended)
+└──────────────────┘               │  ├─ SINGLE dest ◄──── │ encrypted JSON
+                                   │  ├─ PLAIN dest  ◄──── │ plaintext JSON
+                                   │  ├─ SQLite DB         │
+                                   │  └─ LXMF relay ────►  │ Sideband (optional)
+                                   └───────────────────────┘
 ```
 
-**Plaintext path**: RNode sends JSON to well-known PLAIN destination `rnlog.beacon`. Anyone in LoRa range can receive it.
+**LXMF path** (recommended): RNode sends announces and LXMF messages with `FIELD_TELEMETRY`. Supports IFAC network authentication. Requires `provision-lxmf` and optionally `provision-ifac`.
 
-**Encrypted path**: RNode encrypts JSON with the collector's X25519 public key and sends to the collector's SINGLE destination. Only the collector (with the matching private key) can decrypt it. Uses ephemeral ECDH per packet — no shared secrets to manage.
+**Encrypted JSON path**: RNode encrypts JSON with the collector's X25519 public key and sends to the collector's SINGLE destination. Uses ephemeral ECDH per packet. Requires `provision`.
+
+**Plaintext JSON path**: RNode sends JSON to well-known PLAIN destination `rnlog.beacon`. Anyone in LoRa range can receive it. No provisioning needed.
 
 ## Router setup
 

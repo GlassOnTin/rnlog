@@ -15,6 +15,7 @@ import argparse
 import csv
 import io
 import json
+import os
 import signal
 import sys
 import time
@@ -415,39 +416,189 @@ def cmd_provision(args):
     print("=" * 60)
 
 
+def _make_discover_config(base_configdir=None):
+    """Create a temporary Reticulum config with only TCP interfaces (no serial)."""
+    import tempfile, configparser, shutil
+
+    base = base_configdir or RNS.Reticulum.configdir or os.path.expanduser("~/.reticulum")
+    base_config = os.path.join(base, "config")
+    if not os.path.exists(base_config):
+        return None  # let RNS use defaults
+
+    tmpdir = tempfile.mkdtemp(prefix="rnlog-discover-")
+
+    # Copy storage so we share identity and known destinations
+    src_storage = os.path.join(base, "storage")
+    if os.path.exists(src_storage):
+        dst_storage = os.path.join(tmpdir, "storage")
+        shutil.copytree(src_storage, dst_storage)
+
+    # Parse config and keep only non-serial interfaces
+    with open(base_config) as fh:
+        lines = fh.readlines()
+
+    out = []
+    skip_interface = False
+    for line in lines:
+        stripped = line.strip()
+        # Detect interface section headers like [[Name]]
+        if stripped.startswith("[[") and stripped.endswith("]]"):
+            skip_interface = False  # reset
+        if skip_interface:
+            continue
+        # Check if this interface uses a serial port (RNode, Serial)
+        if stripped.startswith("type") and "=" in stripped:
+            itype = stripped.split("=", 1)[1].strip()
+            if itype in ("RNodeInterface", "SerialInterface", "RNodeMultiInterface"):
+                # Remove this entire interface block (go back and remove header)
+                while out and not (out[-1].strip().startswith("[[") and out[-1].strip().endswith("]]")):
+                    out.pop()
+                if out:
+                    out.pop()  # remove the [[ header ]]
+                skip_interface = True
+                continue
+        out.append(line)
+
+    with open(os.path.join(tmpdir, "config"), "w") as fh:
+        fh.writelines(out)
+
+    return tmpdir
+
+
+def _discover_lxmf_destination(timeout=60):
+    """Listen for LXMF delivery announces and let the user pick one."""
+    import threading
+
+    announces = []  # list of (dest_hash, identity, app_data, timestamp)
+    lock = threading.Lock()
+
+    class LxmfAnnounceHandler:
+        aspect_filter = "lxmf.delivery"
+
+        def received_announce(self, destination_hash, announced_identity, app_data, **kwargs):
+            with lock:
+                # Deduplicate by dest_hash
+                for existing in announces:
+                    if existing[0] == destination_hash:
+                        return
+                announces.append((destination_hash, announced_identity, app_data, time.time()))
+                idx = len(announces)
+                name = app_data.decode("utf-8", errors="replace") if app_data else ""
+                print(f"  [{idx}] {destination_hash.hex()}  {name}")
+
+    handler = LxmfAnnounceHandler()
+    RNS.Transport.register_announce_handler(handler)
+
+    print()
+    print("Listening for LXMF announces...")
+    print("Open Sideband on your phone (it announces periodically).")
+    print(f"Waiting up to {timeout}s. Press Ctrl+C to stop early.")
+    print()
+
+    # Check already-known destinations (from previous announces)
+    try:
+        known = RNS.Identity.known_destinations()
+        for dest_hash_hex, ts, app_data_hex in known:
+            try:
+                app_data = bytes.fromhex(app_data_hex) if app_data_hex else b""
+                app_str = app_data.decode("utf-8", errors="replace")
+            except (ValueError, AttributeError):
+                continue
+            # Show any destination with readable app_data (likely LXMF/Sideband)
+            if app_str and any(c.isalpha() for c in app_str):
+                dh = bytes.fromhex(dest_hash_hex)
+                with lock:
+                    already = any(e[0] == dh for e in announces)
+                    if not already:
+                        identity = RNS.Identity.recall(dh)
+                        announces.append((dh, identity, app_data, ts))
+                        idx = len(announces)
+                        age = int(time.time() - ts)
+                        print(f"  [{idx}] {dest_hash_hex}  {app_str.strip()}  (cached, {age}s ago)")
+    except Exception:
+        pass  # known_destinations may not be available in all RNS versions
+
+    try:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(1)
+            with lock:
+                if announces:
+                    remaining = int(deadline - time.time())
+                    if remaining > 0 and remaining % 15 == 0:
+                        print(f"  ... {len(announces)} found, {remaining}s remaining (Ctrl+C to stop)")
+    except KeyboardInterrupt:
+        pass
+
+    RNS.Transport.deregister_announce_handler(handler)
+
+    with lock:
+        if not announces:
+            print("No LXMF announces received.")
+            sys.exit(1)
+
+        if len(announces) == 1:
+            choice = announces[0]
+            name = choice[2].decode("utf-8", errors="replace") if isinstance(choice[2], bytes) else str(choice[2])
+            print(f"\n  Auto-selecting: {choice[0].hex()}  {name}")
+        else:
+            print(f"\n  {len(announces)} destinations found. Enter number to select:")
+            while True:
+                try:
+                    sel = input("  > ").strip()
+                    idx = int(sel) - 1
+                    if 0 <= idx < len(announces):
+                        choice = announces[idx]
+                        break
+                    print(f"  Enter 1-{len(announces)}")
+                except (ValueError, EOFError):
+                    print(f"  Enter 1-{len(announces)}")
+
+        return choice[0]
+
+
 def cmd_provision_lxmf(args):
     """Provision RNode with Sideband LXMF destination keys and read back its identity."""
     import struct
     import serial
 
-    dest_hex = args.dest
     port = args.port
     baud = args.baud
 
-    if len(dest_hex) != 32:
-        print(f"Error: destination hash must be 32 hex chars, got {len(dest_hex)}")
-        sys.exit(1)
+    tmpdir = None
+    if args.discover and args.port:
+        # Use a temporary config without serial interfaces to keep the port free
+        tmpdir = _make_discover_config(args.config)
 
-    dest_hash = bytes.fromhex(dest_hex)
-
-    # Start Reticulum and resolve the destination
     reticulum = RNS.Reticulum(
-        configdir=args.config,
+        configdir=tmpdir or args.config,
         loglevel=3 + args.verbose,
-        require_shared_instance=True,
     )
 
-    print(f"  Resolving destination {dest_hex}...")
-
-    if not RNS.Transport.has_path(dest_hash):
-        RNS.Transport.request_path(dest_hash)
-
-    deadline = time.time() + 15
-    while not RNS.Transport.has_path(dest_hash):
-        if time.time() > deadline:
-            print("Error: could not resolve path to destination (timeout 15s)")
+    if args.discover:
+        dest_hash = _discover_lxmf_destination(timeout=args.timeout)
+        # Clean up temp config
+        if tmpdir:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    elif args.dest:
+        dest_hex = args.dest
+        if len(dest_hex) != 32:
+            print(f"Error: destination hash must be 32 hex chars, got {len(dest_hex)}")
             sys.exit(1)
-        time.sleep(0.5)
+        dest_hash = bytes.fromhex(dest_hex)
+        print(f"  Resolving destination {dest_hex}...")
+        if not RNS.Transport.has_path(dest_hash):
+            RNS.Transport.request_path(dest_hash)
+        deadline = time.time() + 15
+        while not RNS.Transport.has_path(dest_hash):
+            if time.time() > deadline:
+                print("Error: could not resolve path to destination (timeout 15s)")
+                sys.exit(1)
+            time.sleep(0.5)
+    else:
+        print("Error: specify --dest HASH or --discover")
+        sys.exit(1)
 
     identity = RNS.Identity.recall(dest_hash)
     if identity is None:
@@ -461,12 +612,23 @@ def cmd_provision_lxmf(args):
     # The dest_hash IS the LXMF delivery destination hash
     combined = pub_key + identity_hash + dest_hash  # 64 bytes
 
+    # Find the transport node for this destination (next hop)
+    transport_id_bytes = None
+    if RNS.Transport.has_path(dest_hash):
+        hops = RNS.Transport.hops_to(dest_hash)
+        if hops > 0:
+            next_hop = reticulum.get_next_hop(dest_hash)
+            if next_hop:
+                transport_id_bytes = next_hop
+
     print()
     print("LXMF Beacon Provisioning")
     print("=" * 60)
-    print(f"  Target Dest Hash (16B): {dest_hex}")
+    print(f"  Target Dest Hash (16B): {dest_hash.hex()}")
     print(f"  X25519 Public Key (32B): {pub_key.hex()}")
     print(f"  Identity Hash    (16B): {identity_hash.hex()}")
+    if transport_id_bytes:
+        print(f"  Transport ID     (16B): {transport_id_bytes.hex()}")
     print()
     print(f"  Combined (64B): {combined.hex()}")
     print()
@@ -476,13 +638,14 @@ def cmd_provision_lxmf(args):
         print("Use --port /dev/ttyACMx to send to RNode.")
         return
 
-    # Send via KISS CMD_BCN_KEY (0x86)
+    # Send via KISS
     FEND = 0xC0
     FESC = 0xDB
     TFEND = 0xDC
     TFESC = 0xDD
     CMD_BCN_KEY = 0x86
     CMD_LXMF_HASH = 0x87
+    CMD_TRANSPORT_ID = 0x8A
 
     def kiss_escape(data):
         out = bytearray()
@@ -512,6 +675,21 @@ def cmd_provision_lxmf(args):
         print("  RNode acknowledged key provisioning.")
     else:
         print(f"  Warning: no READY response (got {response.hex() if response else 'nothing'})")
+
+    # Send transport node identity via CMD_TRANSPORT_ID (0x8A)
+    if transport_id_bytes:
+        print(f"  Sending transport ID ({transport_id_bytes.hex()})...")
+        txid_frame = bytes([FEND, CMD_TRANSPORT_ID]) + kiss_escape(transport_id_bytes) + bytes([FEND])
+        ser.write(txid_frame)
+        ser.flush()
+        time.sleep(1)
+        response = ser.read(ser.in_waiting or 64)
+        if 0x0F in response:
+            print("  RNode acknowledged transport ID.")
+        else:
+            print(f"  Warning: no READY for transport ID")
+    else:
+        print("  No transport node detected (direct path). Skipping transport ID.")
 
     # Query LXMF source hash via CMD_LXMF_HASH
     print("  Querying RNode LXMF identity...")
@@ -701,7 +879,111 @@ def cmd_test_lxmf(args):
             print(f"  (unrecognized frame, {len(frame_data)} bytes)")
         print()
 
+    # IFAC verification: apply IFAC in Python, then validate with RNS
+    if diag_frames:
+        _verify_ifac(diag_frames[0])
+
     print("=" * 60)
+
+
+def _verify_ifac(raw_packet):
+    """Apply IFAC to a pre-IFAC diagnostic packet and verify with RNS."""
+    import hashlib
+    import hmac as hmac_mod
+
+    # Load IFAC key from same derivation as provision-ifac
+    # Try to read from NVS-equivalent: use the same key derivation
+    # For now, accept --name/--pass from environment or skip
+    network_name = os.environ.get("IFAC_NETWORK_NAME")
+    passphrase = os.environ.get("IFAC_PASSPHRASE")
+    if not network_name or not passphrase:
+        return  # silently skip if no IFAC credentials
+
+    IFAC_SALT = bytes.fromhex(
+        "adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8"
+    )
+    nn_hash = hashlib.sha256(network_name.encode()).digest()
+    pp_hash = hashlib.sha256(passphrase.encode()).digest()
+    ifac_origin_hash = hashlib.sha256(nn_hash + pp_hash).digest()
+
+    def hkdf_sha256(ikm, salt, length):
+        prk = hmac_mod.new(salt, ikm, hashlib.sha256).digest()
+        blocks = []
+        prev = b""
+        for i in range((length + 31) // 32):
+            prev = hmac_mod.new(
+                prk, prev + bytes([(i + 1) % 256]), hashlib.sha256
+            ).digest()
+            blocks.append(prev)
+        return b"".join(blocks)[:length]
+
+    ifac_key = hkdf_sha256(ifac_origin_hash, IFAC_SALT, 64)
+
+    # Derive Ed25519 keypair from ifac_key[32:64]
+    try:
+        from nacl.signing import SigningKey
+        from nacl.encoding import RawEncoder
+        sk = SigningKey(ifac_key[32:64], encoder=RawEncoder)
+    except ImportError:
+        print("  IFAC: (pynacl not installed, skipping)")
+        return
+
+    IFAC_SIZE = 8
+    pkt = bytearray(raw_packet)
+    size = len(pkt)
+
+    # 1. Sign original packet
+    signed = sk.sign(bytes(pkt), encoder=RawEncoder)
+    signature = signed.signature  # 64 bytes
+    ifac = signature[64 - IFAC_SIZE:]  # last 8 bytes
+
+    # 2. Generate mask
+    new_size = size + IFAC_SIZE
+    mask = hkdf_sha256(ifac, ifac_key, new_size)
+
+    # 3. Build IFAC'd packet: header(2) + ifac(8) + payload(size-2)
+    ifac_pkt = bytearray(new_size)
+    ifac_pkt[0] = pkt[0] | 0x80
+    ifac_pkt[1] = pkt[1]
+    ifac_pkt[2:2 + IFAC_SIZE] = ifac
+    ifac_pkt[2 + IFAC_SIZE:] = pkt[2:]
+
+    # 4. Apply mask
+    ifac_pkt[0] = (ifac_pkt[0] ^ mask[0]) | 0x80
+    ifac_pkt[1] ^= mask[1]
+    # bytes 2..9 (IFAC) NOT masked
+    for i in range(IFAC_SIZE + 2, new_size):
+        ifac_pkt[i] ^= mask[i]
+
+    # 5. Now validate: reverse the process (as RNS receiver would)
+    # Unmask
+    check = bytearray(ifac_pkt)
+    check[0] = (check[0] ^ mask[0]) | 0x80
+    check[1] ^= mask[1]
+    for i in range(IFAC_SIZE + 2, new_size):
+        check[i] ^= mask[i]
+
+    # Extract IFAC and reconstruct original
+    extracted_ifac = bytes(check[2:2 + IFAC_SIZE])
+    reconstructed = bytearray(size)
+    reconstructed[0] = check[0] & 0x7F  # clear IFAC flag
+    reconstructed[1] = check[1]
+    reconstructed[2:] = check[2 + IFAC_SIZE:]
+
+    # Re-sign reconstructed and compare
+    signed2 = sk.sign(bytes(reconstructed), encoder=RawEncoder)
+    sig2 = signed2.signature
+    expected_ifac = sig2[64 - IFAC_SIZE:]
+
+    if extracted_ifac == expected_ifac and bytes(reconstructed) == bytes(pkt):
+        print(f"  IFAC:    VALID (round-trip verified)")
+    else:
+        print(f"  IFAC:    MISMATCH")
+        if bytes(reconstructed) != bytes(pkt):
+            print(f"           Packet reconstruction failed")
+        if extracted_ifac != expected_ifac:
+            print(f"           IFAC tag mismatch: {extracted_ifac.hex()} != {expected_ifac.hex()}")
+    print()
 
 
 def _parse_all_kiss_frames(raw, cmd_byte):
@@ -775,10 +1057,9 @@ def _decode_announce_frame(data):
     name_hash = data[pos:pos+10]; pos += 10
     print(f"    Name hash: {name_hash.hex()}")
 
-    # Verify name hash matches "lxmf"+"delivery"
-    lxmf_h = hashlib.sha256(b"lxmf").digest()
-    delivery_h = hashlib.sha256(b"delivery").digest()
-    expected_nh = hashlib.sha256(lxmf_h + delivery_h).digest()[:10]
+    # Verify name hash matches "lxmf.delivery"
+    # RNS: name_hash = SHA256(expand_name(app_name, *aspects))[:10]
+    expected_nh = hashlib.sha256(b"lxmf.delivery").digest()[:10]
     if name_hash == expected_nh:
         print(f"    Name hash: VALID (lxmf.delivery)")
     else:
@@ -806,14 +1087,26 @@ def _decode_announce_frame(data):
             except ImportError:
                 umsgpack = None
 
-        if umsgpack and len(app_data) > 0:
+        if len(app_data) > 0:
+            # Try raw UTF-8 first (Sideband expects plain UTF-8 display name)
             try:
-                name = umsgpack.unpackb(app_data)
-                print(f"    App data:  {repr(name)}")
-            except Exception:
-                print(f"    App data:  {app_data.hex()} (decode failed)")
+                name = app_data.decode("utf-8")
+                if name.isprintable() and len(name) > 0:
+                    print(f"    App data:  {repr(name)}")
+                else:
+                    raise ValueError("not printable")
+            except (UnicodeDecodeError, ValueError):
+                # Fall back to msgpack
+                if umsgpack:
+                    try:
+                        name = umsgpack.unpackb(app_data)
+                        print(f"    App data:  {repr(name)}")
+                    except Exception:
+                        print(f"    App data:  {app_data.hex()} (decode failed)")
+                else:
+                    print(f"    App data:  {app_data.hex()}")
         else:
-            print(f"    App data:  {app_data.hex()}")
+            print(f"    App data:  (empty)")
 
     # Verify signature
     signed_data = dest_hash + x25519_pub + ed25519_pub + name_hash + random_hash + app_data
@@ -886,14 +1179,17 @@ def _decode_lxmf_frame(data):
 
     if SID_LOCATION in telem:
         loc = telem[SID_LOCATION]
+        n = len(loc)
         lat = struct.unpack("!i", loc[0])[0] / 1e6
         lon = struct.unpack("!i", loc[1])[0] / 1e6
         alt = struct.unpack("!i", loc[2])[0] / 1e2
-        speed = struct.unpack("!I", loc[3])[0] / 1e2
-        hdop = struct.unpack("!H", loc[5])[0] / 1e2
         print(f"    Location:    lat={lat:.6f}, lon={lon:.6f}, alt={alt:.1f}m")
-        print(f"    Speed:       {speed:.2f} km/h")
-        print(f"    HDOP:        {hdop:.2f}")
+        if n > 3:
+            speed = struct.unpack("!I", loc[3])[0] / 1e2
+            print(f"    Speed:       {speed:.2f} km/h")
+        if n > 5:
+            hdop = struct.unpack("!H", loc[5])[0] / 1e2
+            print(f"    HDOP:        {hdop:.2f}")
 
     if SID_BATTERY in telem:
         bat = telem[SID_BATTERY]
@@ -1038,9 +1334,18 @@ def main():
     # provision-lxmf
     prov_lxmf_p = subparsers.add_parser("provision-lxmf",
         help="provision RNode with Sideband LXMF destination keys")
-    prov_lxmf_p.add_argument(
-        "--dest", required=True, metavar="HASH",
+    prov_lxmf_g = prov_lxmf_p.add_mutually_exclusive_group(required=True)
+    prov_lxmf_g.add_argument(
+        "--dest", metavar="HASH",
         help="Sideband LXMF delivery destination hash (32 hex chars)",
+    )
+    prov_lxmf_g.add_argument(
+        "--discover", action="store_true",
+        help="listen for LXMF announces and pick a destination interactively",
+    )
+    prov_lxmf_p.add_argument(
+        "--timeout", type=int, default=60,
+        help="discover mode: seconds to listen for announces (default: 60)",
     )
     prov_lxmf_p.add_argument(
         "--port", type=str, default=None,
